@@ -1,96 +1,100 @@
-import { Task } from './task';
-import { Queue } from './queue';
-import { ModbusResponseTimeout } from './errors';
-import { Logger } from './logger';
+var Promise = require("bluebird");
+var _ = require('lodash');
 
-export class SerialHelperFactory {
-    /**
-     * @param {SerialPort} serialPort
-     * @param options
-     * @returns {SerialHelper}
-     */
-    static create(serialPort, options) {
-        const queue = new Queue(options.queueTimeout);
-        return new SerialHelper(serialPort, queue, options);
-    }
+module.exports = SerialHelper;
+
+function SerialHelper(serialPort, options) {
+    var self = this;
+
+    this.queue = [];
+    this._options = options;
+    this.serialPort = serialPort;
+    this.buffers = [];
+    this.currentTask = null;
+
+    this.serialPort.on("open", function () {
+        self.processQueue();
+    });
+
+    var onData = _.debounce(function () {
+        var buffer = Buffer.concat(self.buffers);
+        self._options.debug && console.log('resp', buffer);
+        self.currentTask.deferred.resolve(buffer);
+
+        self.buffers = [];
+    }, options.endPacketTimeout);
+
+    serialPort.on('data', function (data) {
+        if (self.currentTask) {
+            self.buffers.push(data);
+            onData(data);
+        }
+    });
 }
 
-export class SerialHelper {
-    /**
-     * @param {SerialPort} serialPort
-     * @param {Queue<Task>} queue
-     * @param options
-     */
-    constructor(serialPort, queue, options) {
-        /**
-         * @type {Queue<Task>}
-         * @private
-         */
-        this.queue = queue;
-        queue.setTaskHandler(this.handleTask.bind(this));
-
-        /**
-         * @private
-         */
-        this.options = options;
-        this.serialPort = serialPort;
-        this.logger = new Logger(options);
-
-        this.bindToSerialPort();
-    }
-
-    /**
-     *
-     * @param {Buffer} buffer
-     * @returns {Promise}
-     */
-    write(buffer) {
-        const task = new Task(buffer);
-        this.queue.push(task);
-
-        return task.promise;
-    }
-
-    /**
-     * @private
-     */
-    bindToSerialPort() {
-        this.serialPort.on('open', () => {
-            this.queue.start();
-        });
-    }
-
-    /**
-     *
-     * @param {Task} task
-     * @param {function} done
-     * @private
-     */
-    handleTask(task, done) {
-        this.logger.info('write ' + task.payload.toString('HEX'));
-        this.serialPort.write(task.payload, (error) => {
-            if (error) {
-                task.reject(error);
-            }
-        });
-
-        // set execution timeout for task
-        setTimeout(() => {
-            task.reject(new ModbusResponseTimeout(this.options.responseTimeout));
-        }, this.options.responseTimeout);
-
-        const onData = (data) => {
-            task.receiveData(data, (response) => {
-                this.logger.info('resp ' + response.toString('HEX'));
-                task.resolve(response);
-            });
-        };
-
-        this.serialPort.on('data', onData);
-
-        task.promise.catch(() => {}).finally(() => {
-            this.serialPort.removeListener('data', onData);
-            done();
-        });
-    }
+SerialHelper.prototype.updateBaudrate = function(baud) {
+    this.serialPort.update({ baudrate: baud });
 }
+
+SerialHelper.prototype._write = function(buffer, deferred) {
+  this._options.debug && console.log('write', buffer);
+    this.serialPort.write(buffer, function (error) {
+        if (error)
+            deferred.reject(error);
+    });
+
+    return deferred.promise.timeout(this._options.responseTimeout, 'Response timeout exceed!');
+};
+
+SerialHelper.prototype.processQueue = function () {
+    var self = this;
+
+    function continueQueue() {
+        setTimeout(function(){
+            self.processQueue();
+        }, self._options.queueTimeout);  //pause between calls
+    }
+
+    if (this.queue.length) {
+        this.currentTask = this.queue[0];
+        this._write(this.currentTask.buffer, this.currentTask.deferred)
+            .catch(function(err){
+                self.currentTask.deferred.reject(err)
+            })
+            .finally(function () {
+                //remove current task
+                self.queue.shift();
+                continueQueue();
+            }).done();
+    } else {
+        continueQueue();
+    }
+};
+
+SerialHelper.prototype.write = function (buffer) {
+    var deferred = {};
+
+    deferred.promise = new Promise(function (resolve, reject) {
+        deferred.resolve = resolve;
+        deferred.reject = reject;
+    });
+
+    var task = {
+      deferred: deferred,
+      buffer: buffer
+    };
+
+    this.queue.push(task);
+
+    deferred.promise.abort = function() {
+      var _self = this;
+
+      if (deferred.promise.isPending()) {
+        deferred.reject();
+        _.pull(_self.queue, task);
+      }
+    };
+
+    return deferred.promise;
+};
+
